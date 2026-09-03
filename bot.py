@@ -836,6 +836,11 @@ def main():
                     try:
                         min_cost, min_shares = live.minimum_order(token, market["condition"], signal.price)
                         current_ask = up_ask if token == market["up"] else down_ask
+                        if current_ask is None:
+                            p(f"CLOB ADAPTIVE WAIT | asset={market['asset']} | side={signal.side} "
+                              f"| signal=${notion:.4f} | bid=${signal.price:.4f} | ask=None "
+                              f"| reason=NO_CURRENT_ASK")
+                            continue
                         try:
                             tick = float(live.tick_size(token))
                         except Exception:
