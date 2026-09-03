@@ -97,3 +97,9 @@ def test_shadow_mode_cannot_construct_live_client(monkeypatch):
     assert 'if SHADOW and LIVE:' in text
     assert 'LIVE = False' in text
     assert 'if LIVE:\n    from live_clob import LiveCLOB' in text
+
+
+def test_shadow_mode_forces_paper_research_mode(monkeypatch):
+    src=(Path(__file__).parents[1] / "bot.py").read_text()
+    assert 'if SHADOW:' in src and 'PAPER = True' in src
+
