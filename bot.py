@@ -45,10 +45,11 @@ def prepare_fresh_data_dir():
 DATA = prepare_fresh_data_dir()
 
 PAPER = os.getenv("PAPER_TRADING", "true").lower() == "true"
-# SHADOW_CLOB is a hard safety override for non-authenticated Railway
-# deployments.  If an old Railway service still has LIVE_TRADING=true,
-# shadow mode wins and the live CLOB client is never imported/constructed.
+# Shadow mode always runs as paper research mode so the dual instant-vs-realistic
+# simulation is available on Railway without authenticated orders.
 SHADOW = os.getenv("SHADOW_CLOB", "false").lower() == "true"
+if SHADOW:
+    PAPER = True
 LIVE = os.getenv("LIVE_TRADING", "false").lower() == "true"
 if SHADOW and LIVE:
     log.warning("SHADOW_CLOB=true: forcing LIVE_TRADING=false; no authenticated CLOB client will be created")
@@ -113,7 +114,7 @@ else:
 # The benchmark is retained so the realism gap is measurable rather than hidden.
 realistic_fill_enabled = PAPER and os.getenv("REALISTIC_FILL_SIM", "true").lower() in ("1", "true", "yes", "on")
 if realistic_fill_enabled:
-    realistic_ledger = PaperLedger(DATA / "realistic_fill_state.json", strategy.bankroll)
+    realistic_ledger = PaperLedger(DATA / "realistic_fill_state.json", LIVE_CAP if EXECUTION_MODE else strategy.bankroll)
     realistic_feed = PolymarketMarketFeed(
         url=os.getenv("MARKET_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market"),
         reconnect_seconds=float(os.getenv("MARKET_WS_RECONNECT_SECONDS", "2")),
@@ -924,7 +925,7 @@ def main():
 
                 else:
                     trade = ledger.buy(market["condition"], token, market["market"], signal.side, signal.price, notion, now, meta)
-                    if realistic_simulator is not None:
+                    if realistic_simulator is not None and not EXECUTION_MODE:
                         depth_ahead = up_bid_depth if signal.side == "Up" else down_bid_depth
                         # Use the displayed size exactly at the signal price when
                         # available. The regular book() result is the best-bid size
@@ -953,6 +954,32 @@ def main():
                     # trader cadence, rotate the scan, or log a live accepted trade
                     # until an actual CLOB order has been submitted.
                     continue
+
+                # SHADOW mode represents the same accepted strategy signal in the
+                # realistic resting-maker simulator. The shadow CLOB order remains
+                # the instant-execution benchmark; the realistic order is separate.
+                if EXECUTION_MODE and SHADOW and realistic_simulator is not None:
+                    depth_ahead = up_bid_depth if signal.side == "Up" else down_bid_depth
+                    try:
+                        depth_ahead = book_depth_at_price(token, signal.price)
+                    except Exception:
+                        pass
+                    realistic_meta = dict(meta)
+                    realistic_meta.update({
+                        "execution_mode": "REALISTIC_RESTING_MAKER",
+                        "benchmark_order_id": str(executed_order.get("order_id")) if executed_order else "",
+                    })
+                    realistic_order = realistic_simulator.place_order(
+                        condition=market["condition"], market=market["market"], token=token,
+                        side=signal.side, target_price=signal.price, notional=notion,
+                        placed_ts=now, window_end_ts=market["end_ts"],
+                        depth_ahead=depth_ahead, meta=realistic_meta,
+                    )
+                    research.record_realistic_order(
+                        ts=now, market=market, signal=signal, notional=notion,
+                        target_price=signal.price, depth_ahead=depth_ahead, meta=realistic_meta,
+                        order_id=realistic_order["id"],
+                    )
 
                 pending[market["condition"]] = market
                 last_trade[market["condition"]] = now
