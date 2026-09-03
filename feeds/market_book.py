@@ -4,7 +4,8 @@ import json
 import logging
 import threading
 import time
-from typing import Callable, Dict, Optional, Set
+from queue import Empty, Full, Queue
+from typing import Callable, Optional, Set, Tuple
 
 import websocket
 
@@ -16,29 +17,41 @@ WSS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 class PolymarketMarketFeed:
     """Public market-channel WebSocket for book and trade-print events.
 
-    The market channel is unauthenticated.  Trade events include price, size,
-    side and timestamp, which is exactly what the realistic fill simulator
-    needs.  Reconnects resubscribe all known tokens.
+    Socket callbacks only normalize/queue events.  Fill processing happens on a
+    dedicated worker so disk I/O or simulator locks cannot block the WebSocket
+    reader and trigger reconnects/duplicate replays.
     """
 
-    def __init__(self, url: str = WSS_URL, reconnect_seconds: float = 2.0):
+    def __init__(self, url: str = WSS_URL, reconnect_seconds: float = 2.0,
+                 queue_max: int = 50000):
         self.url = url
         self.reconnect_seconds = max(0.5, float(reconnect_seconds))
         self.tokens: Set[str] = set()
         self._trade_callback: Optional[Callable[..., None]] = None
         self._thread: Optional[threading.Thread] = None
+        self._worker: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._ws = None
         self._lock = threading.RLock()
+        self._trade_queue: Queue[Tuple[str, float, float, float, str, str, str]] = Queue(
+            maxsize=max(1000, int(queue_max))
+        )
 
     def set_trade_callback(self, callback):
         self._trade_callback = callback
 
     def start(self):
+        self._stop.clear()
+        if not self._worker or not self._worker.is_alive():
+            self._worker = threading.Thread(
+                target=self._dispatch_loop, name="polymarket-trade-dispatch", daemon=True
+            )
+            self._worker.start()
         if self._thread and self._thread.is_alive():
             return
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="polymarket-market-feed", daemon=True)
+        self._thread = threading.Thread(
+            target=self._run, name="polymarket-market-feed", daemon=True
+        )
         self._thread.start()
 
     def stop(self):
@@ -52,6 +65,14 @@ class PolymarketMarketFeed:
                 pass
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3)
+        if self._worker and self._worker.is_alive():
+            self._worker.join(timeout=3)
+        # Do not replay stale events on a later start().
+        try:
+            while True:
+                self._trade_queue.get_nowait()
+        except Empty:
+            pass
 
     def subscribe(self, token: str):
         token = str(token)
@@ -73,7 +94,9 @@ class PolymarketMarketFeed:
     def _run(self):
         while not self._stop.is_set():
             try:
-                ws = websocket.create_connection(self.url, timeout=10, enable_multithread=True)
+                ws = websocket.create_connection(
+                    self.url, timeout=10, enable_multithread=True
+                )
                 ws.settimeout(10)
                 with self._lock:
                     self._ws = ws
@@ -111,6 +134,30 @@ class PolymarketMarketFeed:
                 if not self._stop.is_set():
                     self._stop.wait(self.reconnect_seconds)
 
+    def _dispatch_loop(self):
+        while not self._stop.is_set():
+            try:
+                event = self._trade_queue.get(timeout=0.5)
+            except Empty:
+                continue
+            try:
+                callback = self._trade_callback
+                if callback is not None:
+                    callback(*event)
+            except Exception:
+                log.exception("MARKET WS TRADE CALLBACK ERROR")
+            finally:
+                self._trade_queue.task_done()
+
+    def _enqueue_trade(self, event):
+        try:
+            self._trade_queue.put_nowait(event)
+        except Full:
+            # Never block the WebSocket reader. Dropping a trade-print event is
+            # preferable to making the socket slow-consumer and triggering a
+            # reconnect storm; the research run records the feed-health warning.
+            log.error("MARKET WS TRADE QUEUE FULL | size=%d", self._trade_queue.qsize())
+
     def _handle(self, data):
         if isinstance(data, list):
             for item in data:
@@ -133,18 +180,21 @@ class PolymarketMarketFeed:
             ts = ts_ms / 1000.0 if ts_ms > 10_000_000_000 else ts_ms
         except (TypeError, ValueError):
             ts = time.time()
+        event_tuple = (
+            str(token), float(price), float(size), ts,
+            str(data.get("id") or data.get("trade_id") or ""),
+            str(side or ""),
+            str(data.get("transaction_hash") or data.get("transactionHash") or ""),
+        )
         callback = self._trade_callback
         if callback is None:
             return
-        try:
-            callback(
-                str(token),
-                float(price),
-                float(size),
-                ts,
-                str(data.get("id") or data.get("transaction_hash") or ""),
-                str(side or ""),
-                str(data.get("transaction_hash") or ""),
-            )
-        except Exception:
-            log.exception("MARKET WS TRADE CALLBACK ERROR")
+        # Before start() tests/direct use historically called _handle directly;
+        # keep that behavior without requiring a live worker.
+        if not self._worker or not self._worker.is_alive():
+            try:
+                callback(*event_tuple)
+            except Exception:
+                log.exception("MARKET WS TRADE CALLBACK ERROR")
+            return
+        self._enqueue_trade(event_tuple)
