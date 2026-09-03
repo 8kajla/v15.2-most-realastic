@@ -38,6 +38,24 @@ class ShadowCLOB:
         data = json.loads(self.path.read_text(encoding="utf-8"))
         self.orders = data.get("orders", {})
         self.seen_markers = set(data.get("seen_markers", []))
+        # FAK orders cancel any unmatched remainder immediately. Older V15.2
+        # shadow state incorrectly persisted partial adaptive orders as LIVE,
+        # which made the live ledger reserve phantom cash until market cutoff.
+        migrated = False
+        for order in self.orders.values():
+            if order.get("adaptive") and order.get("status") in {"LIVE", "PARTIAL"}:
+                if order.get("fill_reported"):
+                    order["status"] = "CANCELED"
+                    order["cancel_reason"] = "FAK_REMAINDER"
+                    migrated = True
+                else:
+                    # Keep it available for the one outstanding confirmed fill
+                    # report, but never expose the unmatched remainder as open.
+                    order["status"] = "CANCELED"
+                    order["cancel_reason"] = "FAK_REMAINDER"
+                    migrated = True
+        if migrated:
+            self._save()
 
     def _save(self):
         tmp = self.path.with_suffix(".tmp")
@@ -147,7 +165,8 @@ class ShadowCLOB:
             "side": "BUY", "price": float(ask), "limit_price": limit,
             "notional": float(fill_shares * float(ask)),
             "shares": requested, "remaining_shares": max(0.0, requested - fill_shares),
-            "status": "FILLED" if fill_shares + 1e-9 >= requested else "PARTIAL",
+            # FAK: any unmatched remainder is canceled, never left resting.
+            "status": "FILLED" if fill_shares + 1e-9 >= requested else "CANCELED",
             "created_at": time.time(), "last_seen": time.time(),
             "min_order_cost": float(ask) * min_shares, "min_shares": min_shares,
             "adaptive": True,
@@ -237,8 +256,10 @@ class ShadowCLOB:
                         "price": order["price"],
                         "fee_rate_bps": "7",
                         "transaction_hash": "", "shadow": True, "adaptive": True,
+                        "order_status": order.get("status", "CANCELED"),
                         "filled_shares": fill_shares,
                         "filled_cost": fill_shares * float(order["price"]),
+                        "remaining_shares": float(order.get("remaining_shares", 0.0)),
                     })
                 continue
             if order.get("status") not in {"LIVE", "PARTIAL"}:
