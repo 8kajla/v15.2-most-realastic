@@ -89,8 +89,13 @@ class CLOBAdaptivePlanner:
         tick_size: float,
         now: float,
     ) -> Optional[AdaptivePlan]:
-        ask = float(current_ask)
-        min_s = float(min_shares)
+        if current_ask is None:
+            return None
+        try:
+            ask = float(current_ask)
+            min_s = float(min_shares)
+        except (TypeError, ValueError):
+            return None
         if not (0.0 < ask < 1.0) or min_s <= 0:
             return None
 
