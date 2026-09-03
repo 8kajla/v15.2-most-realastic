@@ -141,43 +141,68 @@ class ShadowCLOB:
         return {"price": lp, "side": ls}
 
     def adaptive_buy(self, token_id: str, limit_price: float, shares: float, condition: str):
-        """Simulate a marketable FAK BUY using the current public best ask.
+        """Simulate an aggressive FAK BUY against all displayed asks <= limit.
 
-        Only displayed top-of-book ask liquidity is credited. This deliberately
-        understates fills versus the full depth so the shadow result is not falsely
-        optimistic.
+        The strategy allocation is fixed by the caller. We consume available
+        public ask liquidity from best to worst until the requested shares are
+        filled or the V15.2 band/limit is exhausted. Any remainder is canceled;
+        it never becomes a resting order.
         """
         limit = float(limit_price)
         requested = float(shares)
+        if requested <= 0:
+            raise ValueError("shadow adaptive order requires positive shares")
         d = self.book_details(token_id)
-        ask = d.get("best_ask")
-        ask_size = sum(float(x.get("size", 0.0)) for x in (d.get("asks") or [])
-                       if isinstance(x, dict) and abs(float(x.get("price", 0.0)) - float(ask or -1)) < 1e-9)
+        raw_asks = d.get("asks") or []
+        levels = []
+        for row in raw_asks:
+            if not isinstance(row, dict):
+                continue
+            try:
+                px = float(row.get("price"))
+                sz = max(0.0, float(row.get("size", 0.0)))
+            except (TypeError, ValueError):
+                continue
+            if 0.0 < px < 1.0 and sz > 0 and px <= limit + 1e-9:
+                levels.append((px, sz))
+        levels.sort(key=lambda x: x[0])
+        ask = levels[0][0] if levels else None
         min_shares = float(d.get("min_order_size") or 0.0)
-        if ask is None or float(ask) > limit + 1e-9:
+        if ask is None:
             raise ValueError("shadow adaptive order has no acceptable ask")
         if requested + 1e-9 < min_shares:
             raise ValueError("shadow adaptive order below market minimum")
-        fill_shares = min(requested, max(0.0, ask_size))
+
+        remaining = requested
+        fills = []
+        for px, available in levels:
+            if remaining <= 1e-12:
+                break
+            take = min(remaining, available)
+            if take > 0:
+                fills.append({"price": px, "shares": take})
+                remaining -= take
+
+        filled_shares = requested - remaining
         oid = f"shadow-fak-{int(time.time()*1000)}-{uuid.uuid4().hex[:10]}"
         self.orders[oid] = {
             "id": oid, "condition": str(condition), "token": str(token_id),
             "side": "BUY", "price": float(ask), "limit_price": limit,
-            "notional": float(fill_shares * float(ask)),
-            "shares": requested, "remaining_shares": max(0.0, requested - fill_shares),
-            # FAK: any unmatched remainder is canceled, never left resting.
-            "status": "FILLED" if fill_shares + 1e-9 >= requested else "CANCELED",
+            "notional": float(sum(x["price"] * x["shares"] for x in fills)),
+            "requested_notional": float(requested * limit),
+            "shares": requested, "remaining_shares": max(0.0, remaining),
+            "status": "FILLED" if remaining <= 1e-9 else "CANCELED",
             "created_at": time.time(), "last_seen": time.time(),
             "min_order_cost": float(ask) * min_shares, "min_shares": min_shares,
-            "adaptive": True,
-            "fill_reported": False,
+            "adaptive": True, "fill_reported": False, "fills": fills,
         }
         self._save()
         return {
             "success": True, "orderID": oid,
-            "status": "matched" if fill_shares > 0 else "live",
-            "makingAmount": float(fill_shares * float(ask)),
-            "takingAmount": float(fill_shares), "shadow": True, "adaptive": True,
+            "status": "matched" if filled_shares > 0 else "live",
+            "makingAmount": float(sum(x["price"] * x["shares"] for x in fills)),
+            "takingAmount": float(filled_shares), "shadow": True, "adaptive": True,
+            "remainingAmount": float(remaining),
         }
 
     def post_only_buy(self, token_id: str, price: float, notional: float, condition: str):
@@ -245,20 +270,26 @@ class ShadowCLOB:
         now = time.time()
         for oid, order in list(self.orders.items()):
             if order.get("adaptive") and not order.get("fill_reported"):
-                fill_shares = max(0.0, float(order.get("shares", 0.0)) - float(order.get("remaining_shares", 0.0)))
-                if fill_shares > 1e-9:
-                    order["fill_reported"] = True
+                trade_parts = list(order.get("fills") or [])
+                order["fill_reported"] = True
+                for part in trade_parts:
+                    fill_shares = max(0.0, float(part.get("shares", 0.0)))
+                    price = float(part.get("price", order.get("price", 0.0)))
+                    if fill_shares <= 1e-9 or not 0.0 < price < 1.0:
+                        continue
                     fills.append({
                         "id": f"shadow-trade-{uuid.uuid4().hex}",
                         "status": "CONFIRMED", "trader_side": "TAKER",
                         "taker_order_id": oid,
                         "maker_orders": [],
-                        "price": order["price"],
+                        "price": price,
                         "fee_rate_bps": "7",
                         "transaction_hash": "", "shadow": True, "adaptive": True,
                         "order_status": order.get("status", "CANCELED"),
                         "filled_shares": fill_shares,
-                        "filled_cost": fill_shares * float(order["price"]),
+                        "filled_cost": fill_shares * price,
+                        "size": fill_shares,
+                        "matched_amount": fill_shares,
                         "remaining_shares": float(order.get("remaining_shares", 0.0)),
                     })
                 continue
