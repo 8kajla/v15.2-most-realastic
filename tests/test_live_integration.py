@@ -468,3 +468,41 @@ def test_execution_queue_partial_group_consumption(tmp_path):
     assert len(pending) == 1
     assert abs(float(pending[0]["notional"]) - 0.02) < 1e-9
     assert pending[0]["id"] == b
+
+
+def test_live_ledger_releases_partial_fak_remainder(tmp_path):
+    from live_ledger import LiveLedger
+    ledger = LiveLedger(tmp_path / "live.json", 100.0)
+    ledger.record_order("o1", "c1", "t1", "Up", 0.82, 8.2, "BTC", meta={"execution_mode": "CLOB_ADAPTIVE_FAK"})
+    fills = [{
+        "id": "shadow-t1", "status": "CONFIRMED", "trader_side": "TAKER",
+        "taker_order_id": "o1", "maker_orders": [], "price": 0.82,
+        "fee_rate_bps": "7", "order_status": "CANCELED", "shadow": True,
+        "filled_shares": 6.0, "filled_size": 6.0, "size": 6.0, "filled_cost": 4.92,
+    }]
+    booked = ledger.sync_trades(fills)
+    assert len(booked) == 1
+    assert ledger.orders["o1"]["status"] == "CLOSED_OR_CANCELED"
+    assert ledger.total_reserved() == pytest.approx(0.0)
+    assert ledger.cash < 100.0
+
+
+def test_realistic_trade_dedup_same_transaction_different_event_id(tmp_path):
+    from realistic_fill_simulator import RealisticFillSimulator
+    sim = RealisticFillSimulator(tmp_path / "orders.json")
+    sim.place_order(condition="c1", market="m1", token="t1", side="Up", target_price=0.20,
+                    notional=1.0, placed_ts=100.0, window_end_ts=400.0, depth_ahead=0.0)
+    sim.on_trade_print("t1", 0.19, 10.0, 101.0, "event-a", "SELL", "0xabc")
+    sim.on_trade_print("t1", 0.19, 10.0, 101.0, "event-b", "SELL", "0xabc")
+    fills = sim.drain_fills()
+    assert len(fills) == 1
+
+
+def test_realistic_trade_dedup_identical_fingerprint_different_id(tmp_path):
+    from realistic_fill_simulator import RealisticFillSimulator
+    sim = RealisticFillSimulator(tmp_path / "orders.json")
+    sim.place_order(condition="c1", market="m1", token="t1", side="Down", target_price=0.30,
+                    notional=1.0, placed_ts=100.0, window_end_ts=400.0, depth_ahead=0.0)
+    sim.on_trade_print("t1", 0.25, 10.0, 101.123, "event-a", "SELL", "")
+    sim.on_trade_print("t1", 0.25, 10.0, 101.123, "event-b", "SELL", "")
+    assert len(sim.drain_fills()) == 1
