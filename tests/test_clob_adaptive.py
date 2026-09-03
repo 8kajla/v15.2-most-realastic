@@ -28,6 +28,15 @@ def test_mid_signal_batches_before_minimum():
     assert plan.requested_budget >= 2.55
 
 
+def test_none_current_ask_is_safe_wait():
+    p=CLOBAdaptivePlanner()
+    assert p.plan([item(1.0,.50,'MID')], current_ask=None, min_shares=5, tick_size=.01, now=1) is None
+
+def test_invalid_current_ask_is_safe_wait():
+    p=CLOBAdaptivePlanner()
+    assert p.plan([item(1.0,.50,'MID')], current_ask='not-a-price', min_shares=5, tick_size=.01, now=1) is None
+
+
 def test_price_ceiling_rejects_bad_move():
     p=CLOBAdaptivePlanner()
     plan=p.plan([item(4.35,.90,'HIGH')], current_ask=.94, min_shares=5, tick_size=.01, now=1)
