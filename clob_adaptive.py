@@ -42,13 +42,12 @@ class AdaptivePlan:
 
 
 class CLOBAdaptivePlanner:
-    """Plan a bounded-aggression BUY against the current Polymarket CLOB.
+    """Execute current available liquidity without changing V15.2 allocations.
 
-    The strategy signal keeps its original price/notional/regime.  Execution may
-    pay the *current* ask only when that ask is within the signal's regime-derived
-    price ceiling. Multiple signals may share one execution lot when every signal
-    accepts that same current price. The exchange minimum can add a bounded
-    top-up, but only after compatible signal budgets are accumulated.
+    A signal keeps its original strategy fine band and dollar allocation. The
+    executor may pay the current best ask (and consume deeper asks up to that
+    band's upper boundary), but it never moves the signal into another band and
+    never invents extra capital to satisfy the exchange minimum.
     """
 
     def __init__(
@@ -65,20 +64,60 @@ class CLOBAdaptivePlanner:
         self.max_uplift = dict(regime_max_uplift or REGIME_MAX_MINIMUM_UPLIFT)
 
     @staticmethod
-    def max_price(signal_price: float, tick_size: float, regime: str) -> float:
+    def _band_bounds(fine_band: str) -> Optional[Tuple[float, float]]:
+        band = str(fine_band or "").strip()
+        if len(band) < 4:
+            return None
+        try:
+            # V15.2 fine-band names are e.g. C20_30, M50_60, R80_90, H95_100.
+            lo_s, hi_s = band[1:].split("_", 1)
+            lo = float(lo_s) / 100.0
+            hi = float(hi_s) / 100.0
+            return lo, hi
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def same_fine_band(cls, fine_band: str, price: float) -> bool:
+        bounds = cls._band_bounds(fine_band)
+        if bounds is None:
+            return False
+        lo, hi = bounds
+        p = float(price)
+        if str(fine_band).endswith("_100") and p == 1.0:
+            return True
+        return lo <= p < hi
+
+    @classmethod
+    def max_price(cls, signal_price: float, tick_size: float, regime: str, fine_band: Optional[str] = None) -> float:
+        """Return the maximum executable price without leaving the strategy band.
+
+        The strategy's fine band is the execution boundary.  We deliberately do
+        not add an arbitrary spread/uplift allowance here: the current ask may be
+        taken wherever it is available *inside the same V15.2 band*.
+        """
         p = float(signal_price)
         tick = max(float(tick_size), 1e-6)
+        if fine_band:
+            bounds = cls._band_bounds(fine_band)
+            if bounds is not None:
+                _lo, hi = bounds
+                # Keep a one-tick numerical margin below the next band.
+                return min(0.999999, max(p, hi - tick if hi < 1.0 else 0.999999))
+        # Fallback for old persisted queue entries that lack fine_band metadata:
+        # preserve the conservative legacy cap.
         spread_cap = max(float(REGIME_MAX_SPREAD.get(str(regime), 0.02)), 2.0 * tick)
         return min(0.999999, p + spread_cap)
 
-    @staticmethod
-    def _item_max_price(item: Dict[str, Any], tick_size: float) -> float:
+    @classmethod
+    def _item_max_price(cls, item: Dict[str, Any], tick_size: float) -> float:
         meta = item.get("meta") or {}
         explicit = meta.get("max_execution_price")
         if explicit is not None:
             return float(explicit)
         regime = str(meta.get("regime") or "MID")
-        return CLOBAdaptivePlanner.max_price(float(item.get("price", 0.0)), tick_size, regime)
+        fine_band = meta.get("fine_band")
+        return cls.max_price(float(item.get("price", 0.0)), tick_size, regime, fine_band)
 
     def plan(
         self,
@@ -105,32 +144,41 @@ class CLOBAdaptivePlanner:
                 continue
             created = float(item.get("created_at", now))
             if now - created > self.batch_window_seconds and candidates:
-                # Old signals may still execute by themselves, but they should
-                # not make a new batch wait for later unrelated signals.
                 continue
             expiry = item.get("expires_at")
             if expiry is not None and now >= float(expiry):
                 continue
-            try:
+            meta = item.get("meta") or {}
+            fine_band = str(meta.get("fine_band") or "")
+            amount = max(0.0, float(item.get("notional", 0.0)))
+            if amount <= 0:
+                continue
+            # Execution may use whatever liquidity is currently offered, but
+            # never outside the signal's original V15.2 fine price band.
+            if fine_band:
+                if not self.same_fine_band(fine_band, ask):
+                    continue
+            else:
                 pmax = self._item_max_price(item, tick_size)
-                amount = float(item.get("notional", 0.0))
-            except (TypeError, ValueError):
-                continue
-            if amount <= 0 or pmax <= 0:
-                continue
-            if ask <= pmax + 1e-9:
-                candidates.append(item)
+                if ask > pmax + 1e-9:
+                    continue
+            candidates.append(item)
 
         if not candidates:
             return None
 
         candidates.sort(key=lambda x: float(x.get("created_at", now)))
+        # A single CLOB order is allowed to represent only one strategy fine
+        # band. This keeps the measured per-band capital/trade distribution intact.
+        selected_band = str((candidates[0].get("meta") or {}).get("fine_band") or "")
+        if selected_band:
+            candidates = [x for x in candidates if str((x.get("meta") or {}).get("fine_band") or "") == selected_band]
+        if not candidates:
+            return None
+
         minimum_cost = ask * min_s
         selected: List[Dict[str, Any]] = []
         intended = 0.0
-        max_allowed_uplift = float("inf")
-        max_pmax = ask
-
         for item in candidates:
             amount = max(0.0, float(item.get("notional", 0.0)))
             if amount <= 0:
@@ -139,75 +187,29 @@ class CLOBAdaptivePlanner:
                 continue
             selected.append(item)
             intended += amount
-            regime = str((item.get("meta") or {}).get("regime") or "MID")
-            max_allowed_uplift = min(
-                max_allowed_uplift,
-                float(self.max_uplift.get(regime, self.max_uplift.get("MID", 2.0))),
-            )
-            max_pmax = min(max_pmax, self._item_max_price(item, tick_size))
-            if intended >= minimum_cost:
-                break
-            # As soon as the aggregate can be made exchange-valid with a bounded
-            # minimum top-up, stop collecting more unrelated signals.
-            if intended > 0 and minimum_cost / intended <= max_allowed_uplift:
+            if intended + 1e-12 >= minimum_cost:
                 break
 
-        if not selected or intended <= 0:
+        # No synthetic capital top-up: every dollar in the submitted order must
+        # originate from a real V15.2 signal allocation. If the exchange minimum
+        # cannot be met by compatible signals, wait for another signal.
+        if not selected or intended + 1e-12 < minimum_cost:
+            return None
+        if intended > self.max_order + 1e-9:
             return None
 
-        # We cannot submit above the least-permissive signal's price ceiling.
-        execution_price = min(ask, max_pmax)
-        if execution_price + 1e-9 < ask:
-            return None
-
-        minimum_cost = execution_price * min_s
-        if intended < minimum_cost:
-            uplift = minimum_cost / intended
-            if uplift > max_allowed_uplift + 1e-9:
-                # Try to add another signal that still accepts this price.
-                for item in candidates:
-                    if item in selected:
-                        continue
-                    amount = max(0.0, float(item.get("notional", 0.0)))
-                    if amount <= 0 or intended + amount > self.max_order + 1e-9:
-                        continue
-                    selected.append(item)
-                    intended += amount
-                    regime = str((item.get("meta") or {}).get("regime") or "MID")
-                    max_allowed_uplift = min(
-                        max_allowed_uplift,
-                        float(self.max_uplift.get(regime, self.max_uplift.get("MID", 2.0))),
-                    )
-                    if minimum_cost / intended <= max_allowed_uplift + 1e-9:
-                        break
-
-        if intended <= 0:
-            return None
-        minimum_cost = execution_price * min_s
-        if minimum_cost > self.max_order + 1e-9:
-            return None
-
-        if intended < minimum_cost:
-            uplift = minimum_cost / intended
-            if uplift > max_allowed_uplift + 1e-9:
-                return None
-            budget = minimum_cost
-        else:
-            budget = min(intended, self.max_order)
-
-        # Limit shares so the worst-case cost at the limit price stays within the
-        # chosen budget. A FAK/marketable limit may fill cheaper than this price.
-        shares = budget / execution_price
+        shares = intended / ask
         if shares + 1e-9 < min_s:
             return None
 
         return AdaptivePlan(
             items=tuple(selected),
-            execution_price=execution_price,
-            requested_budget=budget,
+            execution_price=ask,
+            requested_budget=intended,
             order_shares=shares,
             min_order_cost=minimum_cost,
             min_shares=min_s,
-            topup=max(0.0, budget - intended),
-            max_execution_price=max_pmax,
+            topup=0.0,
+            max_execution_price=ask,
         )
+
