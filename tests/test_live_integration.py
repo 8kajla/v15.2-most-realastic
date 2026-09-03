@@ -345,7 +345,7 @@ def test_live_strategy_uses_300_virtual_capital_frame():
     assert "max_total_exposure=(300.0 if EXECUTION_MODE" in src
     assert "strategy_cash = ledger.cash / virtual_scale" in src
     assert "strategy_total_exposure = (" in src
-    assert "observed_notional = (" in src
+    assert "strategy.observe_trade_distribution(qband, qnotional)" in src
 
 
 def test_execution_queue_never_pools_different_prices(tmp_path):
