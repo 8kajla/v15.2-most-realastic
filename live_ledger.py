@@ -308,7 +308,15 @@ class LiveLedger:
             self.pending_trades.pop(tid, None)
             self.seen_trades.add(tid)
             order["last_trade_status"] = status
-            order["status"] = "FILLED" if remaining_reserved <= 1e-8 else "PARTIAL"
+            order_status = str(trade.get("order_status") or trade.get("orderStatus") or "").upper()
+            if order_status in {"CANCELED", "CANCELLED", "EXPIRED", "CLOSED_OR_CANCELED"}:
+                # FAK orders can confirm a partial match while the unmatched
+                # remainder is canceled. Release that remainder immediately;
+                # do not keep phantom reservation alive until market cutoff.
+                order["status"] = "CLOSED_OR_CANCELED"
+                order["exchange_status"] = order_status
+            else:
+                order["status"] = "FILLED" if remaining_reserved <= 1e-8 else "PARTIAL"
             self.save()
         return new_fills
 
