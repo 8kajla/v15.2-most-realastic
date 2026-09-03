@@ -5,6 +5,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
+from hashlib import sha256
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
@@ -28,6 +29,10 @@ class RealisticFillSimulator:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.orders: Dict[str, dict] = {}
         self.seen_trade_ids = set()
+        # Secondary dedupe indexes protect against feed/reconnect duplicates
+        # that arrive with a different event id but the same on-chain trade.
+        self.seen_trade_tx_keys = set()
+        self.seen_trade_fingerprints = set()
         self._fill_events: List[dict] = []
         self._lock = threading.RLock()
         self.feed = websocket_feed
@@ -40,6 +45,8 @@ class RealisticFillSimulator:
         data = json.loads(self.path.read_text(encoding="utf-8"))
         self.orders = data.get("orders", {})
         self.seen_trade_ids = set(data.get("seen_trade_ids", []))
+        self.seen_trade_tx_keys = set(data.get("seen_trade_tx_keys", []))
+        self.seen_trade_fingerprints = set(data.get("seen_trade_fingerprints", []))
 
     def save(self):
         with self._lock:
@@ -49,6 +56,8 @@ class RealisticFillSimulator:
                     {
                         "orders": self.orders,
                         "seen_trade_ids": list(self.seen_trade_ids)[-100000:],
+                        "seen_trade_tx_keys": list(self.seen_trade_tx_keys)[-100000:],
+                        "seen_trade_fingerprints": list(self.seen_trade_fingerprints)[-100000:],
                     },
                     indent=2,
                 ),
@@ -133,6 +142,37 @@ class RealisticFillSimulator:
         self.save()
         return dict(order)
 
+    @staticmethod
+    def _trade_fingerprint(token: str, trade_price: float, trade_size: float,
+                           trade_ts: float, trade_side: str) -> str:
+        # Millisecond timestamp is deliberately used here: the public feed's
+        # timestamp resolution is coarse enough that reconnect/replay duplicates
+        # normally retain the same event time while genuine prints remain distinct.
+        raw = (f"{str(token)}|{float(trade_price):.10f}|{float(trade_size):.10f}|"
+               f"{float(trade_ts):.3f}|{str(trade_side).upper()}").encode()
+        return sha256(raw).hexdigest()
+
+    def _trade_already_seen(self, token: str, trade_price: float, trade_size: float,
+                            trade_ts: float, trade_id: str, trade_side: str,
+                            transaction_hash: str) -> bool:
+        event_id = str(trade_id or "").strip()
+        tx = str(transaction_hash or "").strip()
+        fingerprint = self._trade_fingerprint(token, trade_price, trade_size, trade_ts, trade_side)
+        # Prefer the explicit event id, but use tx+payload and payload-only
+        # fingerprints as defensive secondary identity when ids are unstable.
+        if event_id and event_id in self.seen_trade_ids:
+            return True
+        if tx and f"{tx}|{fingerprint}" in self.seen_trade_tx_keys:
+            return True
+        if fingerprint in self.seen_trade_fingerprints:
+            return True
+        if event_id:
+            self.seen_trade_ids.add(event_id)
+        if tx:
+            self.seen_trade_tx_keys.add(f"{tx}|{fingerprint}")
+        self.seen_trade_fingerprints.add(fingerprint)
+        return False
+
     def _qualifies(self, order: dict, trade_price: float, trade_side: str) -> bool:
         if order.get("status") not in PENDING_STATUSES:
             return False
@@ -161,9 +201,9 @@ class RealisticFillSimulator:
         if trade_size <= 0:
             return
         with self._lock:
-            if trade_id in self.seen_trade_ids:
+            if self._trade_already_seen(token, trade_price, trade_size, trade_ts,
+                                        trade_id, trade_side, transaction_hash):
                 return
-            self.seen_trade_ids.add(trade_id)
             changed = False
             # Every qualifying public SELL print is applied once to each resting
             # order that has been alive long enough to see that print. Each order
