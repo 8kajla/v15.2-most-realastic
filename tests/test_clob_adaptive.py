@@ -2,30 +2,71 @@ import pytest
 from clob_adaptive import CLOBAdaptivePlanner
 
 
-def item(n, price, regime, created=0, token='T', side='Up'):
+def item(n, price, regime, created=0, token='T', side='Up', fine_band=None):
+    if fine_band is None:
+        if price < 0.05: fine_band = 'C00_05'
+        elif price < 0.10: fine_band = 'C05_10'
+        elif price < 0.15: fine_band = 'C10_15'
+        elif price < 0.20: fine_band = 'C15_20'
+        elif price < 0.30: fine_band = 'C20_30'
+        elif price < 0.40: fine_band = 'M30_40'
+        elif price < 0.50: fine_band = 'M40_50'
+        elif price < 0.60: fine_band = 'M50_60'
+        elif price < 0.70: fine_band = 'M60_70'
+        elif price < 0.80: fine_band = 'R70_80'
+        elif price < 0.90: fine_band = 'R80_90'
+        elif price < 0.95: fine_band = 'H90_95'
+        else: fine_band = 'H95_100'
     return {
         'status':'queued','notional':n,'price':price,'created_at':created,
         'condition':'C','token':token,'side':side,
-        'meta':{'regime':regime}
+        'meta':{'regime':regime,'fine_band':fine_band}
     }
 
 
-def test_high_single_signal_gets_minimum_lot_without_large_uplift():
+def test_current_ask_can_move_within_same_strategy_band_without_topup():
     p=CLOBAdaptivePlanner(max_order=5,batch_window_seconds=6)
-    plan=p.plan([item(4.35,0.97,'HIGH')], current_ask=0.98, min_shares=5, tick_size=.01, now=1)
+    plan=p.plan([item(4.70,0.92,'HIGH')], current_ask=0.94, min_shares=5, tick_size=.01, now=1)
     assert plan is not None
-    assert plan.execution_price == .98
-    assert round(plan.requested_budget,2) == 4.90
-    assert plan.topup > 0
+    assert plan.execution_price == .94
+    assert plan.requested_budget == pytest.approx(4.70)
+    assert plan.topup == pytest.approx(0.0)
 
 
-def test_mid_signal_batches_before_minimum():
+def test_current_ask_outside_signal_band_is_rejected():
     p=CLOBAdaptivePlanner(max_order=5,batch_window_seconds=6)
-    items=[item(.40,.50,'MID',created=i) for i in range(8)]
+    plan=p.plan([item(2.50,0.92,'HIGH')], current_ask=0.95, min_shares=5, tick_size=.01, now=1)
+    assert plan is None
+
+
+def test_mid_signal_batches_same_band_before_exchange_minimum():
+    p=CLOBAdaptivePlanner(max_order=5,batch_window_seconds=6)
+    items=[item(.40,.50,'MID',created=i, fine_band='M50_60') for i in range(8)]
     plan=p.plan(items, current_ask=.51, min_shares=5, tick_size=.01, now=2)
     assert plan is not None
-    assert plan.requested_budget <= 5
-    assert plan.requested_budget >= 2.55
+    assert plan.requested_budget == pytest.approx(2.8)
+    assert len(plan.items) == 7
+    assert plan.topup == pytest.approx(0.0)
+
+
+def test_small_signals_wait_for_real_compatible_capital_not_synthetic_topup():
+    p=CLOBAdaptivePlanner()
+    one=item(.10,.03,'CHEAP',fine_band='C00_05')
+    assert p.plan([one], current_ask=.04, min_shares=5, tick_size=.01, now=1) is None
+    two=item(.10,.04,'CHEAP',created=1,fine_band='C00_05')
+    plan=p.plan([one,two], current_ask=.04, min_shares=5, tick_size=.01, now=1)
+    assert plan is not None
+    assert plan.requested_budget == pytest.approx(.20)
+    assert plan.topup == pytest.approx(0.0)
+
+
+def test_never_batches_different_fine_bands():
+    p=CLOBAdaptivePlanner(max_order=5,batch_window_seconds=6)
+    items=[item(.40,.50,'MID',created=i,fine_band='M50_60') for i in range(7)] + [item(.40,.60,'MID',created=1,fine_band='M60_70')]
+    plan=p.plan(items, current_ask=.51, min_shares=5, tick_size=.01, now=2)
+    assert plan is not None
+    assert len(plan.items) == 7
+    assert all(x['meta']['fine_band'] == 'M50_60' for x in plan.items)
 
 
 def test_none_current_ask_is_safe_wait():
@@ -36,28 +77,13 @@ def test_invalid_current_ask_is_safe_wait():
     p=CLOBAdaptivePlanner()
     assert p.plan([item(1.0,.50,'MID')], current_ask='not-a-price', min_shares=5, tick_size=.01, now=1) is None
 
-
-def test_price_ceiling_rejects_bad_move():
-    p=CLOBAdaptivePlanner()
-    plan=p.plan([item(4.35,.90,'HIGH')], current_ask=.94, min_shares=5, tick_size=.01, now=1)
-    assert plan is None
-
-
-def test_small_cheap_signal_can_use_bounded_minimum_topup():
-    p=CLOBAdaptivePlanner()
-    plan=p.plan([item(.10,.03,'CHEAP')], current_ask=.04, min_shares=5, tick_size=.01, now=1)
-    assert plan is not None
-    assert round(plan.requested_budget,2) == .20
-
-
 def test_plan_never_exceeds_single_order_cap():
     p=CLOBAdaptivePlanner(max_order=5)
-    items=[item(1.0,.80,'CORE',created=i) for i in range(20)]
+    items=[item(1.0,.80,'CORE',created=i,fine_band='R80_90') for i in range(20)]
     plan=p.plan(items, current_ask=.81, min_shares=5, tick_size=.01, now=5)
     assert plan is not None
     assert plan.requested_budget <= 5.0000001
     assert plan.order_shares * plan.execution_price <= 5.0000001
-
 
 def test_live_clob_adaptive_buy_uses_fak_and_not_post_only(monkeypatch):
     import sys, types
