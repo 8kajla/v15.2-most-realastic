@@ -45,11 +45,10 @@ def prepare_fresh_data_dir():
 DATA = prepare_fresh_data_dir()
 
 PAPER = os.getenv("PAPER_TRADING", "true").lower() == "true"
-# Shadow mode always runs as paper research mode so the dual instant-vs-realistic
-# simulation is available on Railway without authenticated orders.
+# SHADOW_CLOB is a hard safety override for non-authenticated Railway
+# deployments.  If an old Railway service still has LIVE_TRADING=true,
+# shadow mode wins and the live CLOB client is never imported/constructed.
 SHADOW = os.getenv("SHADOW_CLOB", "false").lower() == "true"
-if SHADOW:
-    PAPER = True
 LIVE = os.getenv("LIVE_TRADING", "false").lower() == "true"
 if SHADOW and LIVE:
     log.warning("SHADOW_CLOB=true: forcing LIVE_TRADING=false; no authenticated CLOB client will be created")
@@ -114,7 +113,7 @@ else:
 # The benchmark is retained so the realism gap is measurable rather than hidden.
 realistic_fill_enabled = PAPER and os.getenv("REALISTIC_FILL_SIM", "true").lower() in ("1", "true", "yes", "on")
 if realistic_fill_enabled:
-    realistic_ledger = PaperLedger(DATA / "realistic_fill_state.json", LIVE_CAP if EXECUTION_MODE else strategy.bankroll)
+    realistic_ledger = PaperLedger(DATA / "realistic_fill_state.json", strategy.bankroll)
     realistic_feed = PolymarketMarketFeed(
         url=os.getenv("MARKET_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market"),
         reconnect_seconds=float(os.getenv("MARKET_WS_RECONNECT_SECONDS", "2")),
@@ -511,14 +510,18 @@ def main():
                                 )
                             except Exception as log_exc:
                                 raise RuntimeError(f"LIVE RESEARCH LOGGING HALT: {log_exc}") from log_exc
-                        executed_band, _ = strategy.fine_band(float(fill["price"]))
-                        if executed_band is None:
+                        # Strategy distribution is locked at signal acceptance.
+                        # Execution price/cost is measured separately and must not
+                        # feed back into the strategy's fine-band allocation state.
+                        fill_band = str(fill.get("fine_band") or "")
+                        if not fill_band:
+                            fill_band, _ = strategy.fine_band(float(fill["price"]))
+                        if fill_band is None:
                             raise RuntimeError(f"LIVE FILL PRICE OUTSIDE FINE BANDS: {fill['price']!r}")
-                        observed_notional = (
-                            float(fill["notional"]) / LIVE_SIZE_SCALE
-                            if LIVE_SIZE_SCALE > 0 else float(fill["notional"])
-                        )
-                        strategy.observe_trade_distribution(executed_band, observed_notional)
+                        if not adaptive_planner.same_fine_band(fill_band, float(fill["price"])):
+                            raise RuntimeError(
+                                f"LIVE FILL PRICE LEFT STRATEGY BAND: band={fill_band} price={float(fill['price']):.6f}"
+                            )
                         last_trade[fill.get("condition")] = now
                         p(
                             f"LIVE FILL | trade_id={fill['trade_id']} | order_id={fill['order_id']} "
@@ -791,7 +794,7 @@ def main():
                         signal_tick = float(live.tick_size(token))
                     except Exception:
                         signal_tick = float(os.getenv("DEFAULT_TICK_SIZE", "0.01"))
-                    meta["max_execution_price"] = adaptive_planner.max_price(signal.price, signal_tick, regime)
+                    meta["max_execution_price"] = adaptive_planner.max_price(signal.price, signal_tick, regime, fine_band=band)
                     meta["adaptive_regime"] = regime
 
                     try:
@@ -905,9 +908,22 @@ def main():
                             order_id, market["condition"], token, signal.side,
                             plan.execution_price, plan.requested_budget, market["market"], meta=selected_meta
                         )
+                        submitted_signal_budget = sum(float(x.get("notional", 0.0)) for x in plan.items)
                         execution_queue.mark_submitted_group(
-                            {"items": list(plan.items)}, plan.requested_budget if plan.requested_budget <= sum(float(x.get("notional",0)) for x in plan.items)+1e-9 else sum(float(x.get("notional",0)) for x in plan.items), order_id
+                            {"items": list(plan.items)}, submitted_signal_budget, order_id
                         )
+                        # DistributionController tracks the strategy allocation,
+                        # not the eventual exchange fill price. Record each
+                        # strategy signal represented by this submitted order
+                        # exactly once. This keeps V15.2 band trade/capital shares
+                        # invariant even when execution price differs from the bid.
+                        for queued_item in plan.items:
+                            qmeta = queued_item.get("meta") or {}
+                            qband = str(qmeta.get("fine_band") or "")
+                            qnotional = float(queued_item.get("notional", 0.0))
+                            if not qband or qnotional <= 0:
+                                raise RuntimeError("LIVE DISTRIBUTION HALT: queued signal missing fine-band/notional")
+                            strategy.observe_trade_distribution(qband, qnotional)
                         live_order_submitted = True
                         executed_order = {"order_id": order_id, "plan": plan, "response": response}
                         p(f"LIVE ORDER SUBMITTED | mode=CLOB_ADAPTIVE_FAK | order_id={order_id} | asset={market['asset']} "
@@ -925,7 +941,7 @@ def main():
 
                 else:
                     trade = ledger.buy(market["condition"], token, market["market"], signal.side, signal.price, notion, now, meta)
-                    if realistic_simulator is not None and not EXECUTION_MODE:
+                    if realistic_simulator is not None:
                         depth_ahead = up_bid_depth if signal.side == "Up" else down_bid_depth
                         # Use the displayed size exactly at the signal price when
                         # available. The regular book() result is the best-bid size
@@ -954,32 +970,6 @@ def main():
                     # trader cadence, rotate the scan, or log a live accepted trade
                     # until an actual CLOB order has been submitted.
                     continue
-
-                # SHADOW mode represents the same accepted strategy signal in the
-                # realistic resting-maker simulator. The shadow CLOB order remains
-                # the instant-execution benchmark; the realistic order is separate.
-                if EXECUTION_MODE and SHADOW and realistic_simulator is not None:
-                    depth_ahead = up_bid_depth if signal.side == "Up" else down_bid_depth
-                    try:
-                        depth_ahead = book_depth_at_price(token, signal.price)
-                    except Exception:
-                        pass
-                    realistic_meta = dict(meta)
-                    realistic_meta.update({
-                        "execution_mode": "REALISTIC_RESTING_MAKER",
-                        "benchmark_order_id": str(executed_order.get("order_id")) if executed_order else "",
-                    })
-                    realistic_order = realistic_simulator.place_order(
-                        condition=market["condition"], market=market["market"], token=token,
-                        side=signal.side, target_price=signal.price, notional=notion,
-                        placed_ts=now, window_end_ts=market["end_ts"],
-                        depth_ahead=depth_ahead, meta=realistic_meta,
-                    )
-                    research.record_realistic_order(
-                        ts=now, market=market, signal=signal, notional=notion,
-                        target_price=signal.price, depth_ahead=depth_ahead, meta=realistic_meta,
-                        order_id=realistic_order["id"],
-                    )
 
                 pending[market["condition"]] = market
                 last_trade[market["condition"]] = now
