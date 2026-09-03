@@ -114,3 +114,24 @@ def test_shadow_adaptive_fak_cancels_unfilled_remainder(tmp_path):
     assert fills[0]["order_status"] == "CANCELED"
     assert fills[0]["remaining_shares"] == pytest.approx(4.0)
     assert s.get_trades() == []
+
+
+def test_shadow_adaptive_fak_consumes_multiple_ask_levels_within_limit(tmp_path):
+    s = ShadowCLOB(tmp_path / "shadow.json")
+    fake = FakeSession()
+    fake.book["asks"] = [
+        {"price": "0.82", "size": "6"},
+        {"price": "0.83", "size": "7"},
+        {"price": "0.91", "size": "20"},
+    ]
+    s.session = fake
+    response = s.adaptive_buy("t1", 0.90, 10.0, "c1")
+    oid = response["orderID"]
+    assert response["takingAmount"] == pytest.approx(10.0)
+    assert s.orders[oid]["status"] == "FILLED"
+    trades = s.get_trades()
+    assert [(round(t["price"], 2), round(t["size"], 6)) for t in trades] == [
+        (0.82, 6.0), (0.83, 4.0)
+    ]
+    assert sum(float(t["filled_cost"]) for t in trades) == pytest.approx(6*0.82 + 4*0.83)
+    assert s.get_trades() == []
