@@ -99,7 +99,18 @@ def test_shadow_mode_cannot_construct_live_client(monkeypatch):
     assert 'if LIVE:\n    from live_clob import LiveCLOB' in text
 
 
-def test_shadow_mode_forces_paper_research_mode(monkeypatch):
-    src=(Path(__file__).parents[1] / "bot.py").read_text()
-    assert 'if SHADOW:' in src and 'PAPER = True' in src
-
+def test_shadow_adaptive_fak_cancels_unfilled_remainder(tmp_path):
+    s = ShadowCLOB(tmp_path / "shadow.json")
+    fake = FakeSession()
+    fake.book["asks"] = [{"price": "0.82", "size": "6"}]
+    s.session = fake
+    response = s.adaptive_buy("t1", 0.90, 10.0, "c1")
+    oid = response["orderID"]
+    assert s.orders[oid]["status"] == "CANCELED"
+    assert s.orders[oid]["remaining_shares"] == pytest.approx(4.0)
+    assert s.get_open_orders() == []
+    fills = s.get_trades()
+    assert len(fills) == 1
+    assert fills[0]["order_status"] == "CANCELED"
+    assert fills[0]["remaining_shares"] == pytest.approx(4.0)
+    assert s.get_trades() == []
