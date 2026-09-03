@@ -1,0 +1,8 @@
+CLOB SHADOW PACKAGE
+
+This package is derived from the V15.2 $100 live deployment.
+
+Do NOT replace the existing AWS live bot with this package.
+Do NOT add private trading credentials to the Railway shadow service.
+Use the Railway environment in railway.env.example.
+For AWS live trading, keep the existing V15.2 live package and its authenticated CLOB adapter.

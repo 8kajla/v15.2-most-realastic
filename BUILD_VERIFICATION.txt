@@ -1,0 +1,32 @@
+V15.2 REALISTIC FILL BUILD VERIFICATION
+
+Strategy preservation
+---------------------
+strategy.py SHA-256:        6121c88b006afa97c4636b87a97c00ee6f82b2aa266afdd462d5a33d2d1c2003
+trader_behavior.json SHA-256: 576deebee751f24a363289ef142aad327d26264bbb4b7f28d76aeb42b487c685
+
+Both hashes match the verified V15.2 exact-trader reference files.
+
+Verification
+------------
+pytest: 88 passed
+py_compile: bot.py, paper_ledger.py, realistic_fill_simulator.py, research_logger.py,
+            market_discovery.py, clob_adaptive.py, live_execution.py, live_ledger.py,
+            live_risk.py, shadow_clob.py, strategy.py, feeds/market_book.py
+
+Realistic-fill coverage
+-----------------------
+- pending order creation without cash/position mutation
+- qualifying SELL trade-print fill
+- queue-ahead approximation
+- partial then full fill
+- non-qualifying BUY trade rejection
+- market-end expiry
+- same-price queue ordering
+- crash/restart fill reconciliation
+- WebSocket last_trade_price parsing
+
+Important
+---------
+The realistic fill simulator is a shadow approximation, not exact exchange queue priority.
+It does not model hidden liquidity, exact FIFO queue ownership, or market impact.
